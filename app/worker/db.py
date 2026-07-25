@@ -16,6 +16,7 @@ async compartilhado entre processos.
 """
 
 from collections.abc import Generator
+from contextlib import contextmanager
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -40,7 +41,9 @@ def _get_engine():
     return _engine
 
 
-def get_worker_session() -> Generator[Session, None, None]:
+@contextmanager
+def worker_session() -> Generator[Session, None, None]:
+    """Sessão síncrona por task: abre, entrega, faz rollback em erro e fecha sempre."""
     _get_engine()
     session = _SessionLocal()
     try:
