@@ -1,24 +1,32 @@
 import hashlib
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import consultas
 from app.api.deps import get_current_tenant
 from app.core.config import get_settings
+from app.core.hashing import hash_termo_busca
 from app.db.session import get_db
-from app.models.consulta_log import ConsultaLog
 from app.models.tenant import Tenant
 from app.schemas.busca import BuscaResponse, ConfiancaMatch, ResultadoBusca, TipoBusca
 from app.services import billing
-from app.services.cnpj_resolver import CnpjNaoEncontradoError, CnpjResolverError, resolver_razao_social
-from app.services.datajud_adapter import DataJudAdapter, DataJudError, normalizar_processo_datajud
+from app.services.cnpj_resolver import (
+    CnpjInvalidoError,
+    CnpjNaoEncontradoError,
+    CnpjResolverError,
+    resolver_razao_social,
+)
+from app.services.datajud_adapter import (
+    DataJudAdapter,
+    DataJudError,
+    normalizar_processo_datajud,
+)
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/busca", tags=["busca"])
 settings = get_settings()
-
-
-def _hash_termo(termo: str) -> str:
-    return hashlib.sha256(termo.strip().lower().encode("utf-8")).hexdigest()
 
 
 @router.get("", response_model=BuscaResponse)
@@ -57,12 +65,10 @@ async def buscar(
 
     tribunais_alvo = tribunais or settings.TRIBUNAIS_BUSCA_PADRAO
     custo = settings.PRECO_BUSCA_PARTE_CENTAVOS
-    termo_hash = _hash_termo(termo)
+    termo_hash = hash_termo_busca(termo)
 
     # Checa saldo antes de qualquer fan-out custoso.
-    saldo_atual = await billing.obter_saldo_atual(db, tenant.id)
-    if saldo_atual < custo:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente")
+    await consultas.garantir_saldo(db, tenant.id, custo)
 
     termo_resolvido = None
     nome_busca = termo
@@ -71,10 +77,19 @@ async def buscar(
     if tipo == TipoBusca.CNPJ:
         try:
             info = await resolver_razao_social(termo)
-        except CnpjNaoEncontradoError:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="CNPJ não encontrado na Receita Federal")
+        except CnpjNaoEncontradoError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="CNPJ não encontrado na Receita Federal"
+            ) from exc
+        except CnpjInvalidoError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         except CnpjResolverError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+            # Falha da BrasilAPI, não do cliente: 502, e sem cobrar a busca.
+            logger.warning("Resolução de CNPJ falhou: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Falha ao resolver o CNPJ na base pública da Receita Federal",
+            ) from exc
 
         nome_busca = info["razao_social"]
         termo_resolvido = nome_busca
@@ -86,8 +101,12 @@ async def buscar(
         )
 
     # Fan-out nos tribunais alvo. Cada chamada é independente — uma falha
-    # isolada num tribunal não derruba a busca inteira, só some do resultado.
+    # isolada num tribunal não derruba a busca inteira, mas também não pode
+    # sumir em silêncio: o tribunal que falhou vai logado e devolvido em
+    # `tribunais_com_falha`, senão "zero resultados" fica indistinguível de
+    # "a fonte estava fora do ar" — e o cliente paga pelos dois igual.
     resultados: list[ResultadoBusca] = []
+    tribunais_com_falha: list[str] = []
     adapter = DataJudAdapter()
     try:
         for tribunal in tribunais_alvo:
@@ -95,27 +114,37 @@ async def buscar(
                 brutos = await adapter.buscar_por_nome(
                     nome_busca, tribunal, tamanho=settings.LIMITE_RESULTADOS_BUSCA_NOME
                 )
-            except DataJudError:
-                continue  # tribunal não mapeado — pula, não derruba a busca inteira
+            except DataJudError as exc:
+                logger.warning("Busca por nome falhou no tribunal %s: %s", tribunal, exc)
+                tribunais_com_falha.append(tribunal)
+                continue
             except Exception:
-                continue  # timeout/erro de rede pontual no tribunal — idem
+                logger.exception("Erro inesperado na busca por nome no tribunal %s", tribunal)
+                tribunais_com_falha.append(tribunal)
+                continue
 
             for bruto in brutos:
                 dados = normalizar_processo_datajud(bruto, tribunal)
                 resultados.append(
                     ResultadoBusca(processo=dados, confianca_match=ConfiancaMatch.PROVAVEL)
                 )
-    finally:
-        await adapter.close()
+
+    if len(tribunais_com_falha) == len(tribunais_alvo):
+        # Nenhum tribunal respondeu: não existe busca a cobrar, e devolver
+        # 200 com lista vazia mentiria dizendo "nada consta".
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Nenhum tribunal respondeu à busca (falha na fonte de dados). Nada foi cobrado.",
+        )
 
     # Cobra pela busca (mesmo com zero resultados — o trabalho de pesquisar
     # em N tribunais foi feito; diferente de /processos, aqui não há "match
     # exato" que justifique isentar consulta sem resultado).
     try:
         await billing.debitar(db, tenant.id, custo, descricao=f"Busca por {tipo.value}")
-    except billing.SaldoInsuficienteError:
+    except billing.SaldoInsuficienteError as exc:
         await db.rollback()
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente")
+        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente") from exc
 
     db.add(
         ConsultaLog(
@@ -129,10 +158,18 @@ async def buscar(
     )
     await db.commit()
 
+    if tribunais_com_falha:
+        aviso_parcial = (
+            "Resultado parcial: não foi possível consultar "
+            f"{', '.join(tribunais_com_falha)}. Repita a busca para cobrir esses tribunais."
+        )
+        aviso = f"{aviso} {aviso_parcial}" if aviso else aviso_parcial
+
     return BuscaResponse(
         tipo_busca=tipo,
         termo_resolvido=termo_resolvido,
-        tribunais_pesquisados=tribunais_alvo,
+        tribunais_pesquisados=[t for t in tribunais_alvo if t not in tribunais_com_falha],
+        tribunais_com_falha=tribunais_com_falha,
         resultados=resultados,
         aviso=aviso,
     )

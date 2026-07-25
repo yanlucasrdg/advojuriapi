@@ -7,10 +7,10 @@ existe apenas no momento da criação, mostrada uma única vez ao usuário.
 Isso é o mesmo padrão do Stripe/GitHub: se perder, gera outra, nunca recupera a antiga.
 """
 
-import hashlib
 import secrets
 
 from app.core.config import get_settings
+from app.core.hashing import sha256_hex
 
 settings = get_settings()
 
@@ -29,7 +29,7 @@ def gerar_api_key(ambiente: str = "live") -> tuple[str, str]:
 
 
 def hash_api_key(chave_texto_puro: str) -> str:
-    return hashlib.sha256(chave_texto_puro.encode("utf-8")).hexdigest()
+    return sha256_hex(chave_texto_puro)
 
 
 def extrair_ambiente(chave_texto_puro: str) -> str:

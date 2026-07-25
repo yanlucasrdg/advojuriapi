@@ -1,6 +1,6 @@
 import enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.schemas.processo import ProcessoResponse
 
@@ -25,6 +25,10 @@ class ResultadoBusca(BaseModel):
 class BuscaResponse(BaseModel):
     tipo_busca: TipoBusca
     termo_resolvido: str | None = None  # ex: razão social encontrada a partir do CNPJ
-    tribunais_pesquisados: list[str]
+    tribunais_pesquisados: list[str]  # os que responderam de fato
+    tribunais_com_falha: list[str] = Field(
+        default_factory=list,
+        description="Tribunais que não responderam. Resultado é parcial: pode haver processos não listados.",
+    )
     resultados: list[ResultadoBusca]
     aviso: str | None = None
