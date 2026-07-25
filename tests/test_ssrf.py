@@ -27,6 +27,11 @@ def test_rejeita_sem_hostname():
         validar_url_webhook("https:///webhook")
 
 
+def test_rejeita_url_malformada():
+    with pytest.raises(WebhookUrlInseguraError):
+        validar_url_webhook("https://exemplo.com:99999/webhook")
+
+
 @pytest.mark.parametrize(
     "ip",
     [

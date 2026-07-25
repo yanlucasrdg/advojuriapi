@@ -3,6 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_tenant
 from app.core.security import gerar_webhook_secret
@@ -28,10 +29,11 @@ async def criar_monitoramento(
     não criamos monitoramento "às cegas" para número que nunca validamos
     contra o DataJud, porque não saberíamos nem se o processo existe.
     """
+    # A validação resolve DNS (bloqueante): fora do event loop.
     try:
-        validar_url_webhook(payload.webhook_url)
+        await run_in_threadpool(validar_url_webhook, payload.webhook_url)
     except WebhookUrlInseguraError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     stmt = select(Processo).where(Processo.numero_cnj == payload.numero_cnj)
     resultado = await db.execute(stmt)

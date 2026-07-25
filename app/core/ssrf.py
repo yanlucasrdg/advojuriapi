@@ -40,7 +40,11 @@ def validar_url_webhook(url: str) -> None:
     Levanta WebhookUrlInseguraError se a URL não for um destino HTTPS público.
     Retorna None (silencioso) se estiver ok.
     """
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        porta = parsed.port or 443
+    except ValueError as exc:
+        raise WebhookUrlInseguraError(f"webhook_url malformada: {exc}") from exc
 
     if parsed.scheme != "https":
         raise WebhookUrlInseguraError(
@@ -52,9 +56,9 @@ def validar_url_webhook(url: str) -> None:
         raise WebhookUrlInseguraError("webhook_url sem hostname válido")
 
     try:
-        infos = socket.getaddrinfo(hostname, parsed.port or 443, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(hostname, porta, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
-        raise WebhookUrlInseguraError(f"Não foi possível resolver o host de webhook_url: {exc}")
+        raise WebhookUrlInseguraError(f"Não foi possível resolver o host de webhook_url: {exc}") from exc
 
     ips = {info[4][0] for info in infos}
     if not ips:
