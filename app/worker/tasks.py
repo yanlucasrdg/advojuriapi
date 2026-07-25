@@ -21,6 +21,7 @@ from sqlalchemy import select
 
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
+from app.core.ssrf import WebhookUrlInseguraError, validar_url_webhook
 from app.models.consulta_log import ConsultaLog  # noqa: F401 - garante metadata carregado
 from app.models.monitoramento import AlertaEnviado, Monitoramento
 from app.models.processo import Movimento, Processo

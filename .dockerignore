@@ -1,0 +1,22 @@
+# Nunca copiar segredos para dentro da imagem (o Dockerfile faz COPY . .)
+.env
+.env.*
+
+.git
+.gitignore
+.dockerignore
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+.vscode/
+.idea/
+.DS_Store
+
+README.md
+tests/
