@@ -31,7 +31,14 @@ class LedgerTransacao(Base, UUIDMixin, TimestampMixin):
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
-    tipo: Mapped[TipoTransacao] = mapped_column(Enum(TipoTransacao, name="tipo_transacao"), nullable=False)
+    tipo: Mapped[TipoTransacao] = mapped_column(
+        Enum(
+            TipoTransacao,
+            name="tipo_transacao",
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
+        nullable=False,
+    )
     valor_centavos: Mapped[int] = mapped_column(BigInteger, nullable=False)  # negativo em consulta, positivo em recarga
     saldo_apos_centavos: Mapped[int] = mapped_column(BigInteger, nullable=False)
     referencia_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # id da consulta ou id do pagamento
