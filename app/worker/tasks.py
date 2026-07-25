@@ -41,11 +41,8 @@ def _buscar_no_datajud_sync(numero_cnj: str, tribunal: str) -> dict | None:
     """
 
     async def _fetch():
-        adapter = DataJudAdapter()
-        try:
+        async with DataJudAdapter() as adapter:
             return await adapter.buscar_por_numero_cnj(numero_cnj, tribunal)
-        finally:
-            await adapter.close()
 
     return asyncio.run(_fetch())
 

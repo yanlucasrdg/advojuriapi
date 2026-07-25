@@ -4,10 +4,11 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import consultas
 from app.api.deps import get_current_tenant
 from app.core.config import get_settings
+from app.core.hashing import hash_termo_busca
 from app.db.session import get_db
-from app.models.consulta_log import ConsultaLog
 from app.models.processo import Movimento, Parte, Processo
 from app.models.tenant import Tenant
 from app.schemas.processo import ProcessoResponse
@@ -22,10 +23,6 @@ from app.services.datajud_adapter import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/processos", tags=["processos"])
 settings = get_settings()
-
-
-def _hash_termo(termo: str) -> str:
-    return hashlib.sha256(termo.strip().lower().encode("utf-8")).hexdigest()
 
 
 @router.get("/{numero_cnj}", response_model=ProcessoResponse)
@@ -43,7 +40,7 @@ async def consultar_processo(
     então precisamos saber onde procurar antes de gastar o request.
     """
     custo = settings.PRECO_CONSULTA_PROCESSO_CENTAVOS
-    termo_hash = _hash_termo(numero_cnj)
+    termo_hash = hash_termo_busca(numero_cnj)
 
     # 1. Tenta cache primeiro — nem olha pro saldo se já temos o dado fresco,
     #    exceto que ainda cobra: o cliente está comprando "a resposta", não
@@ -75,9 +72,7 @@ async def consultar_processo(
     # 2. Cache miss (ou expirado) — checa saldo ANTES de bater na fonte externa.
     #    Não queremos gastar rate-limit do DataJud numa consulta que o
     #    cliente não vai conseguir pagar.
-    saldo_atual = await billing.obter_saldo_atual(db, tenant.id)
-    if saldo_atual < custo:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente")
+    await consultas.garantir_saldo(db, tenant.id, custo)
 
     adapter = DataJudAdapter()
     try:
@@ -100,15 +95,14 @@ async def consultar_processo(
         await adapter.close()
 
     if bruto is None:
-        db.add(
-            ConsultaLog(
-                tenant_id=tenant.id,
-                tipo_busca="numero_cnj",
-                termo_busca_hash=termo_hash,
-                custo_centavos=0,  # não cobra consulta sem resultado
-                resultado_encontrado=False,
-                origem_cache=False,
-            )
+        consultas.registrar_consulta(
+            db,
+            tenant.id,
+            tipo_busca="numero_cnj",
+            termo_hash=termo_hash,
+            custo_centavos=0,  # não cobra consulta sem resultado
+            resultado_encontrado=False,
+            origem_cache=False,
         )
         await db.commit()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Processo não encontrado")

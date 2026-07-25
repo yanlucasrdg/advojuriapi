@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 
 from app.core.config import get_settings
+from app.core.hashing import sha256_hex
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -148,6 +149,25 @@ class DataJudAdapter:
             fontes.append(fonte)
         return fontes
 
+    async def __aenter__(self) -> "DataJudAdapter":
+        return self
+
+    async def __aexit__(self, *_exc_info) -> None:
+        await self.close()
+
+    async def _buscar_hits(self, tribunal: str, query: dict[str, Any]) -> list[dict[str, Any]]:
+        """Cada tribunal é um índice Elasticsearch separado: resolve o alias
+        do índice, dispara a query DSL e devolve os `_source` dos hits."""
+        alias = ALIAS_TRIBUNAL.get(tribunal.upper())
+        if alias is None:
+            raise DataJudError(f"Tribunal '{tribunal}' não mapeado em ALIAS_TRIBUNAL")
+
+        resposta = await self._client.post(f"/{alias}/_search", json=query)
+        resposta.raise_for_status()
+
+        hits = resposta.json().get("hits", {}).get("hits", [])
+        return [hit["_source"] for hit in hits]
+
     async def buscar_por_numero_cnj(self, numero_cnj: str, tribunal: str) -> dict[str, Any] | None:
         """
         Busca um processo pelo número CNJ dentro do índice de um tribunal específico.
@@ -208,7 +228,7 @@ def normalizar_processo_datajud(bruto: dict[str, Any], tribunal: str) -> dict[st
                 "data_movimento": data_str,
                 "descricao": descricao,
                 "codigo_cnj": str(mov.get("codigo", "")) or None,
-                "hash_dedup": hashlib.sha256(dedup_source.encode("utf-8")).hexdigest(),
+                "hash_dedup": sha256_hex(dedup_source),
             }
         )
 

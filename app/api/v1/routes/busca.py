@@ -4,10 +4,11 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import consultas
 from app.api.deps import get_current_tenant
 from app.core.config import get_settings
+from app.core.hashing import hash_termo_busca
 from app.db.session import get_db
-from app.models.consulta_log import ConsultaLog
 from app.models.tenant import Tenant
 from app.schemas.busca import BuscaResponse, ConfiancaMatch, ResultadoBusca, TipoBusca
 from app.services import billing
@@ -26,10 +27,6 @@ from app.services.datajud_adapter import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/busca", tags=["busca"])
 settings = get_settings()
-
-
-def _hash_termo(termo: str) -> str:
-    return hashlib.sha256(termo.strip().lower().encode("utf-8")).hexdigest()
 
 
 @router.get("", response_model=BuscaResponse)
@@ -68,12 +65,10 @@ async def buscar(
 
     tribunais_alvo = tribunais or settings.TRIBUNAIS_BUSCA_PADRAO
     custo = settings.PRECO_BUSCA_PARTE_CENTAVOS
-    termo_hash = _hash_termo(termo)
+    termo_hash = hash_termo_busca(termo)
 
     # Checa saldo antes de qualquer fan-out custoso.
-    saldo_atual = await billing.obter_saldo_atual(db, tenant.id)
-    if saldo_atual < custo:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente")
+    await consultas.garantir_saldo(db, tenant.id, custo)
 
     termo_resolvido = None
     nome_busca = termo
@@ -133,8 +128,6 @@ async def buscar(
                 resultados.append(
                     ResultadoBusca(processo=dados, confianca_match=ConfiancaMatch.PROVAVEL)
                 )
-    finally:
-        await adapter.close()
 
     if len(tribunais_com_falha) == len(tribunais_alvo):
         # Nenhum tribunal respondeu: não existe busca a cobrar, e devolver
