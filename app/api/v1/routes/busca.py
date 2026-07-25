@@ -1,24 +1,18 @@
-import hashlib
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import consultas
 from app.api.deps import get_current_tenant
 from app.core.config import get_settings
+from app.core.hashing import hash_termo_busca
 from app.db.session import get_db
-from app.models.consulta_log import ConsultaLog
 from app.models.tenant import Tenant
 from app.schemas.busca import BuscaResponse, ConfiancaMatch, ResultadoBusca, TipoBusca
-from app.services import billing
 from app.services.cnpj_resolver import CnpjNaoEncontradoError, CnpjResolverError, resolver_razao_social
 from app.services.datajud_adapter import DataJudAdapter, DataJudError, normalizar_processo_datajud
 
 router = APIRouter(prefix="/busca", tags=["busca"])
 settings = get_settings()
-
-
-def _hash_termo(termo: str) -> str:
-    return hashlib.sha256(termo.strip().lower().encode("utf-8")).hexdigest()
 
 
 @router.get("", response_model=BuscaResponse)
@@ -57,12 +51,10 @@ async def buscar(
 
     tribunais_alvo = tribunais or settings.TRIBUNAIS_BUSCA_PADRAO
     custo = settings.PRECO_BUSCA_PARTE_CENTAVOS
-    termo_hash = _hash_termo(termo)
+    termo_hash = hash_termo_busca(termo)
 
     # Checa saldo antes de qualquer fan-out custoso.
-    saldo_atual = await billing.obter_saldo_atual(db, tenant.id)
-    if saldo_atual < custo:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente")
+    await consultas.garantir_saldo(db, tenant.id, custo)
 
     termo_resolvido = None
     nome_busca = termo
@@ -88,8 +80,7 @@ async def buscar(
     # Fan-out nos tribunais alvo. Cada chamada é independente — uma falha
     # isolada num tribunal não derruba a busca inteira, só some do resultado.
     resultados: list[ResultadoBusca] = []
-    adapter = DataJudAdapter()
-    try:
+    async with DataJudAdapter() as adapter:
         for tribunal in tribunais_alvo:
             try:
                 brutos = await adapter.buscar_por_nome(
@@ -105,27 +96,19 @@ async def buscar(
                 resultados.append(
                     ResultadoBusca(processo=dados, confianca_match=ConfiancaMatch.PROVAVEL)
                 )
-    finally:
-        await adapter.close()
 
     # Cobra pela busca (mesmo com zero resultados — o trabalho de pesquisar
     # em N tribunais foi feito; diferente de /processos, aqui não há "match
     # exato" que justifique isentar consulta sem resultado).
-    try:
-        await billing.debitar(db, tenant.id, custo, descricao=f"Busca por {tipo.value}")
-    except billing.SaldoInsuficienteError:
-        await db.rollback()
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente")
-
-    db.add(
-        ConsultaLog(
-            tenant_id=tenant.id,
-            tipo_busca=tipo.value,
-            termo_busca_hash=termo_hash,
-            custo_centavos=custo,
-            resultado_encontrado=len(resultados) > 0,
-            origem_cache=False,
-        )
+    await consultas.cobrar(db, tenant.id, custo, descricao=f"Busca por {tipo.value}")
+    consultas.registrar_consulta(
+        db,
+        tenant.id,
+        tipo_busca=tipo.value,
+        termo_hash=termo_hash,
+        custo_centavos=custo,
+        resultado_encontrado=len(resultados) > 0,
+        origem_cache=False,
     )
     await db.commit()
 

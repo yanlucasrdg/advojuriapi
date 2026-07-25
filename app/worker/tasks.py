@@ -25,7 +25,7 @@ from app.models.consulta_log import ConsultaLog  # noqa: F401 - garante metadata
 from app.models.monitoramento import AlertaEnviado, Monitoramento
 from app.models.processo import Movimento, Processo
 from app.services.datajud_adapter import DataJudAdapter, normalizar_processo_datajud
-from app.worker.db import get_worker_session
+from app.worker.db import worker_session
 from app.worker.webhook import assinar_payload, identificar_movimentos_novos, montar_payload_webhook
 
 logger = logging.getLogger(__name__)
@@ -41,11 +41,8 @@ def _buscar_no_datajud_sync(numero_cnj: str, tribunal: str) -> dict | None:
     """
 
     async def _fetch():
-        adapter = DataJudAdapter()
-        try:
+        async with DataJudAdapter() as adapter:
             return await adapter.buscar_por_numero_cnj(numero_cnj, tribunal)
-        finally:
-            await adapter.close()
 
     return asyncio.run(_fetch())
 
@@ -57,13 +54,9 @@ def varrer_monitoramentos_ativos() -> int:
     de verificação de cada monitoramento — não faz o trabalho pesado ela
     mesma, pra não virar uma task gigante e monolítica que trava a fila.
     """
-    session_gen = get_worker_session()
-    db = next(session_gen)
-    try:
+    with worker_session() as db:
         stmt = select(Monitoramento.id).where(Monitoramento.ativo.is_(True))
         ids = db.execute(stmt).scalars().all()
-    finally:
-        session_gen.close()
 
     for monitoramento_id in ids:
         verificar_processo_monitorado.delay(str(monitoramento_id))
@@ -79,9 +72,7 @@ def varrer_monitoramentos_ativos() -> int:
     default_retry_delay=60,
 )
 def verificar_processo_monitorado(self, monitoramento_id: str) -> None:
-    session_gen = get_worker_session()
-    db = next(session_gen)
-    try:
+    with worker_session() as db:
         monitoramento = db.get(Monitoramento, monitoramento_id)
         if monitoramento is None or not monitoramento.ativo:
             return
@@ -151,9 +142,6 @@ def verificar_processo_monitorado(self, monitoramento_id: str) -> None:
         for alerta_id in alertas_para_enviar:
             enviar_webhook.delay(alerta_id)
 
-    finally:
-        session_gen.close()
-
 
 @celery_app.task(
     name="app.worker.tasks.enviar_webhook",
@@ -161,9 +149,7 @@ def verificar_processo_monitorado(self, monitoramento_id: str) -> None:
     max_retries=settings.WEBHOOK_MAX_TENTATIVAS,
 )
 def enviar_webhook(self, alerta_id: str) -> None:
-    session_gen = get_worker_session()
-    db = next(session_gen)
-    try:
+    with worker_session() as db:
         alerta = db.get(AlertaEnviado, alerta_id)
         if alerta is None:
             return
@@ -224,6 +210,3 @@ def enviar_webhook(self, alerta_id: str) -> None:
 
         alerta.status_entrega = "entregue"
         db.commit()
-
-    finally:
-        session_gen.close()
