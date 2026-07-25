@@ -17,7 +17,11 @@ Federal periodicamente e servir localmente, não aumentar a carga na
 BrasilAPI.
 """
 
+import logging
+
 import httpx
+
+logger = logging.getLogger(__name__)
 
 BRASILAPI_BASE_URL = "https://brasilapi.com.br/api/cnpj/v1"
 
@@ -27,7 +31,15 @@ class CnpjNaoEncontradoError(Exception):
 
 
 class CnpjResolverError(Exception):
-    pass
+    """Base dos erros do resolver. Nada de httpx.* vaza daqui."""
+
+
+class CnpjInvalidoError(CnpjResolverError):
+    """Erro do chamador: CNPJ malformado. Vira 400."""
+
+
+class CnpjResolverIndisponivelError(CnpjResolverError):
+    """BrasilAPI fora do ar / resposta inesperada. Vira 502 — não é culpa do cliente."""
 
 
 def normalizar_cnpj(cnpj: str) -> str:
@@ -41,21 +53,35 @@ async def resolver_razao_social(cnpj: str) -> dict:
     """
     cnpj_limpo = normalizar_cnpj(cnpj)
     if len(cnpj_limpo) != 14:
-        raise CnpjResolverError(f"CNPJ inválido: '{cnpj}' (esperado 14 dígitos)")
+        raise CnpjInvalidoError(f"CNPJ inválido: '{cnpj}' (esperado 14 dígitos)")
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             resposta = await client.get(f"{BRASILAPI_BASE_URL}/{cnpj_limpo}")
         except httpx.HTTPError as exc:
-            raise CnpjResolverError(f"Falha ao consultar BrasilAPI: {exc}")
+            logger.warning("Falha de rede ao consultar a BrasilAPI: %s", exc)
+            raise CnpjResolverIndisponivelError(f"Falha ao consultar BrasilAPI: {exc}") from exc
 
     if resposta.status_code == 404:
         raise CnpjNaoEncontradoError(f"CNPJ {cnpj} não encontrado na base da Receita Federal")
-    resposta.raise_for_status()
 
-    dados = resposta.json()
+    if resposta.is_error:
+        logger.warning("BrasilAPI respondeu %s: %s", resposta.status_code, resposta.text[:500])
+        raise CnpjResolverIndisponivelError(f"BrasilAPI retornou HTTP {resposta.status_code}")
+
+    try:
+        dados = resposta.json()
+    except ValueError as exc:
+        logger.warning("BrasilAPI devolveu corpo não-JSON para o CNPJ %s", cnpj_limpo)
+        raise CnpjResolverIndisponivelError("Resposta da BrasilAPI não é JSON válido") from exc
+
+    if not isinstance(dados, dict) or not dados.get("razao_social"):
+        # Sem razão social não dá para seguir para a busca por nome: seguir
+        # em frente aqui buscaria por string vazia e devolveria lixo cobrado.
+        raise CnpjResolverIndisponivelError("BrasilAPI não retornou 'razao_social' para o CNPJ consultado")
+
     return {
-        "razao_social": dados.get("razao_social", ""),
+        "razao_social": dados["razao_social"],
         "nome_fantasia": dados.get("nome_fantasia") or None,
         "situacao": dados.get("descricao_situacao_cadastral"),
     }

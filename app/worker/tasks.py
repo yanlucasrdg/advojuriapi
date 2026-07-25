@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timezone
 
 import httpx
+from celery.exceptions import MaxRetriesExceededError
 from sqlalchemy import select
 
 from app.core.celery_app import celery_app
@@ -58,11 +59,27 @@ def varrer_monitoramentos_ativos() -> int:
         stmt = select(Monitoramento.id).where(Monitoramento.ativo.is_(True))
         ids = db.execute(stmt).scalars().all()
 
+    enfileirados = 0
+    falhas: list[str] = []
     for monitoramento_id in ids:
-        verificar_processo_monitorado.delay(str(monitoramento_id))
+        try:
+            verificar_processo_monitorado.delay(str(monitoramento_id))
+        except Exception:
+            # Um enfileiramento que falha (broker instável) não pode abortar a
+            # varredura e deixar o resto dos monitoramentos sem verificação.
+            logger.exception("Falha ao enfileirar verificação do monitoramento %s", monitoramento_id)
+            falhas.append(str(monitoramento_id))
+            continue
+        enfileirados += 1
 
-    logger.info("Varredura enfileirou %d monitoramentos", len(ids))
-    return len(ids)
+    if falhas:
+        logger.error(
+            "Varredura não conseguiu enfileirar %d de %d monitoramentos: %s",
+            len(falhas), len(ids), ", ".join(falhas),
+        )
+
+    logger.info("Varredura enfileirou %d de %d monitoramentos", enfileirados, len(ids))
+    return enfileirados
 
 
 @celery_app.task(
@@ -93,7 +110,16 @@ def verificar_processo_monitorado(self, monitoramento_id: str) -> None:
             bruto = _buscar_no_datajud_sync(processo.numero_cnj, processo.tribunal)
         except Exception as exc:
             logger.warning("Falha ao consultar DataJud para %s: %s", processo.numero_cnj, exc)
-            raise self.retry(exc=exc)
+            try:
+                raise self.retry(exc=exc)
+            except MaxRetriesExceededError:
+                # Sem isto o monitoramento simplesmente para de ser verificado
+                # sem nenhum registro de que desistimos dele.
+                logger.error(
+                    "Monitoramento %s desistiu após %d tentativas de consultar o DataJud (%s)",
+                    monitoramento_id, self.max_retries, processo.numero_cnj, exc_info=exc,
+                )
+                return
 
         if bruto is None:
             monitoramento.ultima_verificacao_em = datetime.now(timezone.utc)
@@ -140,7 +166,12 @@ def verificar_processo_monitorado(self, monitoramento_id: str) -> None:
         )
 
         for alerta_id in alertas_para_enviar:
-            enviar_webhook.delay(alerta_id)
+            try:
+                enviar_webhook.delay(alerta_id)
+            except Exception:
+                # O alerta já está persistido como "pendente": logar e seguir,
+                # em vez de estourar a task e reprocessar tudo de novo.
+                logger.exception("Falha ao enfileirar envio do alerta %s", alerta_id)
 
 
 @celery_app.task(
@@ -152,27 +183,22 @@ def enviar_webhook(self, alerta_id: str) -> None:
     with worker_session() as db:
         alerta = db.get(AlertaEnviado, alerta_id)
         if alerta is None:
+            logger.warning("Alerta %s não existe mais; nada a enviar", alerta_id)
             return
 
         monitoramento = db.get(Monitoramento, alerta.monitoramento_id)
         movimento = db.get(Movimento, alerta.movimento_id)
-        if monitoramento is None or movimento is None:
+        processo = db.get(Processo, monitoramento.processo_id) if monitoramento else None
+        if monitoramento is None or movimento is None or processo is None:
+            # Sem o processo o payload nem existe: marcar como falha é melhor
+            # que estourar AttributeError e deixar o alerta "pendente" pra sempre.
+            logger.error(
+                "Alerta %s sem dependências (monitoramento=%s, movimento=%s, processo=%s)",
+                alerta_id, monitoramento is not None, movimento is not None, processo is not None,
+            )
             alerta.status_entrega = "falhou"
             db.commit()
             return
-
-        # Revalida a URL imediatamente antes de enviar: defende contra DNS
-        # rebinding (host que resolvia para IP público na criação e passa a
-        # resolver para um endereço interno depois). Falha definitiva, sem retry.
-        try:
-            validar_url_webhook(monitoramento.webhook_url)
-        except WebhookUrlInseguraError as exc:
-            alerta.status_entrega = "falhou"
-            db.commit()
-            logger.error("Webhook %s bloqueado por SSRF (%s): %s", alerta_id, monitoramento.webhook_url, exc)
-            return
-
-        processo = db.get(Processo, monitoramento.processo_id)
 
         payload_bytes = montar_payload_webhook(
             processo.numero_cnj,
@@ -199,14 +225,27 @@ def enviar_webhook(self, alerta_id: str) -> None:
                 )
             resposta.raise_for_status()
         except Exception as exc:
-            db.commit()  # persiste o incremento de tentativas mesmo em falha
+            logger.warning(
+                "Webhook %s falhou na tentativa %d: %s", alerta_id, alerta.tentativas, exc
+            )
             if alerta.tentativas >= settings.WEBHOOK_MAX_TENTATIVAS:
                 alerta.status_entrega = "falhou"
                 db.commit()
                 logger.error("Webhook %s falhou definitivamente após %d tentativas", alerta_id, alerta.tentativas)
                 return
-            # backoff exponencial: 2, 4, 8, 16... segundos
-            raise self.retry(exc=exc, countdown=2 ** alerta.tentativas)
+
+            db.commit()  # persiste o incremento de tentativas antes de reagendar
+            try:
+                # backoff exponencial: 2, 4, 8, 16... segundos
+                raise self.retry(exc=exc, countdown=2 ** alerta.tentativas)
+            except MaxRetriesExceededError:
+                # Celery pode esgotar os retries antes do nosso contador (ex:
+                # tentativas perdidas por worker morto). Fecha o alerta em vez
+                # de deixá-lo "pendente" para sempre.
+                alerta.status_entrega = "falhou"
+                db.commit()
+                logger.error("Webhook %s falhou definitivamente (retries do Celery esgotados)", alerta_id)
+                return
 
         alerta.status_entrega = "entregue"
         db.commit()

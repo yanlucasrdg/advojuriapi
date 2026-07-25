@@ -24,7 +24,9 @@ Isso precisa ser resolvido no produto (schema `TipoBusca`) antes de vender
 a funcionalidade como está na landing page hoje.
 """
 
-from datetime import datetime, timezone
+import hashlib
+import logging
+from datetime import date, datetime, timezone
 from typing import Any
 
 import httpx
@@ -32,6 +34,7 @@ import httpx
 from app.core.config import get_settings
 from app.core.hashing import sha256_hex
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # Mapa parcial tribunal -> alias do índice DataJud.
@@ -56,7 +59,21 @@ ALIAS_TRIBUNAL: dict[str, str] = {
 
 
 class DataJudError(Exception):
-    pass
+    """Base de todos os erros do adapter. Nunca deixamos httpx.* vazar daqui:
+    o chamador precisa distinguir "pedido inválido" de "fonte externa quebrada"
+    sem conhecer a biblioteca HTTP que usamos por baixo."""
+
+
+class TribunalNaoMapeadoError(DataJudError):
+    """Erro do chamador: tribunal fora de ALIAS_TRIBUNAL. Vira 400."""
+
+
+class DataJudIndisponivelError(DataJudError):
+    """Falha de rede, timeout ou status de erro vindo do DataJud. Vira 502."""
+
+
+class DataJudRespostaInvalidaError(DataJudError):
+    """DataJud respondeu 200 com um corpo que não bate com o schema esperado. Vira 502."""
 
 
 class DataJudAdapter:
@@ -71,7 +88,66 @@ class DataJudAdapter:
         )
 
     async def close(self) -> None:
-        await self._client.aclose()
+        try:
+            await self._client.aclose()
+        except Exception:
+            # Fechar o client nunca deve mascarar o erro (ou o resultado) da
+            # chamada que acabou de acontecer no bloco try do chamador.
+            logger.warning("Falha ao fechar o client HTTP do DataJud", exc_info=True)
+
+    @staticmethod
+    def _resolver_alias(tribunal: str) -> str:
+        alias = ALIAS_TRIBUNAL.get(tribunal.upper())
+        if alias is None:
+            raise TribunalNaoMapeadoError(f"Tribunal '{tribunal}' não mapeado em ALIAS_TRIBUNAL")
+        return alias
+
+    async def _search(self, alias: str, query: dict[str, Any]) -> dict[str, Any]:
+        """Executa a query e traduz qualquer falha de transporte/protocolo
+        para a hierarquia DataJudError."""
+        try:
+            resposta = await self._client.post(f"/{alias}/_search", json=query)
+            resposta.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "DataJud respondeu %s para o índice %s: %s",
+                exc.response.status_code, alias, exc.response.text[:500],
+            )
+            raise DataJudIndisponivelError(
+                f"DataJud retornou HTTP {exc.response.status_code} para o índice '{alias}'"
+            ) from exc
+        except httpx.HTTPError as exc:
+            logger.warning("Falha de rede ao consultar o DataJud (%s): %s", alias, exc)
+            raise DataJudIndisponivelError(f"Falha ao consultar o DataJud ('{alias}'): {exc}") from exc
+
+        try:
+            corpo = resposta.json()
+        except ValueError as exc:
+            logger.warning("DataJud devolveu corpo não-JSON para o índice %s", alias)
+            raise DataJudRespostaInvalidaError(f"Resposta do DataJud não é JSON válido ('{alias}')") from exc
+
+        if not isinstance(corpo, dict):
+            raise DataJudRespostaInvalidaError(f"Resposta do DataJud não é um objeto JSON ('{alias}')")
+        return corpo
+
+    @staticmethod
+    def _extrair_hits(corpo: dict[str, Any], alias: str) -> list[dict[str, Any]]:
+        hits = (corpo.get("hits") or {}).get("hits")
+        if hits is None:
+            return []
+        if not isinstance(hits, list):
+            raise DataJudRespostaInvalidaError(f"Campo 'hits.hits' inesperado na resposta do DataJud ('{alias}')")
+
+        fontes: list[dict[str, Any]] = []
+        for hit in hits:
+            fonte = hit.get("_source") if isinstance(hit, dict) else None
+            if not isinstance(fonte, dict):
+                # Um hit malformado não invalida os demais, mas também não pode
+                # sumir sem registro — é sinal de mudança de schema no CNJ.
+                logger.warning("Hit sem '_source' utilizável na resposta do DataJud (%s)", alias)
+                continue
+            fontes.append(fonte)
+        return fontes
 
     async def __aenter__(self) -> "DataJudAdapter":
         return self
@@ -98,6 +174,8 @@ class DataJudAdapter:
         O tribunal precisa ser conhecido de antemão porque cada tribunal é um índice
         separado — não existe busca cross-tribunal num único request.
         """
+        alias = self._resolver_alias(tribunal)
+
         query = {
             "query": {
                 "match": {
@@ -106,7 +184,8 @@ class DataJudAdapter:
             }
         }
 
-        hits = await self._buscar_hits(tribunal, query)
+        corpo = await self._search(alias, query)
+        hits = self._extrair_hits(corpo, alias)
         return hits[0] if hits else None
 
     async def buscar_por_nome(self, nome: str, tribunal: str, tamanho: int = 20) -> list[dict[str, Any]]:
@@ -114,6 +193,8 @@ class DataJudAdapter:
         Busca por nome de parte (fuzzy match). Ver aviso de limitação no topo
         do arquivo — isto NÃO é equivalente a buscar por CPF/CNPJ.
         """
+        alias = self._resolver_alias(tribunal)
+
         query = {
             "size": tamanho,
             "query": {
@@ -126,7 +207,8 @@ class DataJudAdapter:
             },
         }
 
-        return await self._buscar_hits(tribunal, query)
+        corpo = await self._search(alias, query)
+        return self._extrair_hits(corpo, alias)
 
 
 def normalizar_processo_datajud(bruto: dict[str, Any], tribunal: str) -> dict[str, Any]:
@@ -169,7 +251,7 @@ def normalizar_processo_datajud(bruto: dict[str, Any], tribunal: str) -> dict[st
         "orgao_julgador": (bruto.get("orgaoJulgador") or {}).get("nome"),
         "valor_acao": None,  # nem sempre presente no DataJud; depende do tribunal
         "data_ajuizamento": bruto.get("dataAjuizamento"),
-        "segredo_justica": bruto.get("nivelSigilo", 0) > 0,
+        "segredo_justica": (bruto.get("nivelSigilo") or 0) > 0,
         "fonte": "datajud",
         "atualizado_em": datetime.now(timezone.utc),
         "partes": partes,

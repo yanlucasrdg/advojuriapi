@@ -15,7 +15,7 @@ task precisa dela, dentro do processo já "forkado". Nada de estado
 async compartilhado entre processos.
 """
 
-from collections.abc import Generator
+from collections.abc import Iterator
 from contextlib import contextmanager
 
 from sqlalchemy import create_engine
@@ -42,8 +42,17 @@ def _get_engine():
 
 
 @contextmanager
-def worker_session() -> Generator[Session, None, None]:
-    """Sessão síncrona por task: abre, entrega, faz rollback em erro e fecha sempre."""
+def worker_session() -> Iterator[Session]:
+    """
+    Sessão do worker como context manager.
+
+    Precisa ser um context manager (e não um gerador consumido com `next()`):
+    fechando um gerador com `.close()`, a exceção levantada pelo chamador
+    nunca chega ao `except` daqui dentro, então o rollback explícito jamais
+    roda — a transação pendente ficava para o `close()` desfazer por acaso.
+    Com `with`, uma task que falha no meio sempre faz rollback antes de
+    devolver a conexão para o pool.
+    """
     _get_engine()
     session = _SessionLocal()
     try:

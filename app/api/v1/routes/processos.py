@@ -1,3 +1,6 @@
+import hashlib
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,9 +12,15 @@ from app.db.session import get_db
 from app.models.processo import Movimento, Parte, Processo
 from app.models.tenant import Tenant
 from app.schemas.processo import ProcessoResponse
-from app.services import cache
-from app.services.datajud_adapter import DataJudAdapter, DataJudError, normalizar_processo_datajud
+from app.services import billing, cache
+from app.services.datajud_adapter import (
+    DataJudAdapter,
+    DataJudError,
+    TribunalNaoMapeadoError,
+    normalizar_processo_datajud,
+)
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/processos", tags=["processos"])
 settings = get_settings()
 
@@ -39,17 +48,23 @@ async def consultar_processo(
     processo_cacheado = await cache.buscar_processo_em_cache(db, numero_cnj)
 
     if processo_cacheado and cache.cache_esta_fresco(processo_cacheado):
-        await consultas.cobrar(
-            db, tenant.id, custo, descricao="Consulta (cache)", referencia_id=str(processo_cacheado.id)
-        )
-        consultas.registrar_consulta(
-            db,
-            tenant.id,
-            tipo_busca="numero_cnj",
-            termo_hash=termo_hash,
-            custo_centavos=custo,
-            resultado_encontrado=True,
-            origem_cache=True,
+        try:
+            await billing.debitar(
+                db, tenant.id, custo, referencia_id=str(processo_cacheado.id), descricao="Consulta (cache)"
+            )
+        except billing.SaldoInsuficienteError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente") from exc
+
+        db.add(
+            ConsultaLog(
+                tenant_id=tenant.id,
+                tipo_busca="numero_cnj",
+                termo_busca_hash=termo_hash,
+                custo_centavos=custo,
+                resultado_encontrado=True,
+                origem_cache=True,
+            )
         )
         await db.commit()
         return processo_cacheado
@@ -59,15 +74,25 @@ async def consultar_processo(
     #    cliente não vai conseguir pagar.
     await consultas.garantir_saldo(db, tenant.id, custo)
 
-    async with DataJudAdapter() as adapter:
-        try:
-            bruto = await adapter.buscar_por_numero_cnj(numero_cnj, tribunal)
-        except DataJudError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-        except Exception:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY, detail="Falha ao consultar a fonte de dados (DataJud)"
-            )
+    adapter = DataJudAdapter()
+    try:
+        bruto = await adapter.buscar_por_numero_cnj(numero_cnj, tribunal)
+    except TribunalNaoMapeadoError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except DataJudError as exc:
+        logger.warning("Consulta ao DataJud falhou para %s/%s: %s", tribunal, numero_cnj, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Falha ao consultar a fonte de dados (DataJud)"
+        ) from exc
+    except Exception as exc:
+        # Erro nosso, não do DataJud: registrar com stack trace em vez de
+        # devolver um 502 genérico que apaga o rastro do bug.
+        logger.exception("Erro inesperado ao consultar o DataJud para %s/%s", tribunal, numero_cnj)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Falha ao consultar a fonte de dados (DataJud)"
+        ) from exc
+    finally:
+        await adapter.close()
 
     if bruto is None:
         consultas.registrar_consulta(
@@ -102,17 +127,21 @@ async def consultar_processo(
     for m in dados_normalizados["movimentos"]:
         db.add(Movimento(processo_id=processo.id, **m))
 
-    await consultas.cobrar(
-        db, tenant.id, custo, descricao="Consulta (DataJud)", referencia_id=str(processo.id)
-    )
-    consultas.registrar_consulta(
-        db,
-        tenant.id,
-        tipo_busca="numero_cnj",
-        termo_hash=termo_hash,
-        custo_centavos=custo,
-        resultado_encontrado=True,
-        origem_cache=False,
+    try:
+        await billing.debitar(db, tenant.id, custo, referencia_id=str(processo.id), descricao="Consulta (DataJud)")
+    except billing.SaldoInsuficienteError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente") from exc
+
+    db.add(
+        ConsultaLog(
+            tenant_id=tenant.id,
+            tipo_busca="numero_cnj",
+            termo_busca_hash=termo_hash,
+            custo_centavos=custo,
+            resultado_encontrado=True,
+            origem_cache=False,
+        )
     )
     await db.commit()
     await db.refresh(processo, attribute_names=["partes", "movimentos"])
