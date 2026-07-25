@@ -17,3 +17,4 @@ redis==5.0.8
 # Testes
 pytest==8.3.3
 pytest-asyncio==0.24.0
+aiosqlite==0.20.0  # engine in-memory usada pelos testes de billing

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import gerar_api_key
@@ -52,6 +53,14 @@ async def signup(payload: SignupRequest, db: AsyncSession = Depends(get_db)):
             ambiente="live",
         )
     )
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # Dois signups simultâneos com o mesmo e-mail passam os dois pelo
+        # SELECT acima e só colidem na constraint UNIQUE do banco. É o mesmo
+        # conflito de negócio detectado antes, então responde igual (409),
+        # em vez de vazar um 500 de constraint violation.
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="E-mail já cadastrado") from exc
 
     return SignupResponse(tenant_id=str(tenant.id), api_key=chave_texto_puro)
