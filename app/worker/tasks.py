@@ -20,6 +20,7 @@ from sqlalchemy import select
 
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
+from app.core.ssrf import WebhookUrlInseguraError, validar_url_webhook
 from app.models.consulta_log import ConsultaLog  # noqa: F401 - garante metadata carregado
 from app.models.monitoramento import AlertaEnviado, Monitoramento
 from app.models.processo import Movimento, Processo
@@ -172,6 +173,17 @@ def enviar_webhook(self, alerta_id: str) -> None:
         if monitoramento is None or movimento is None:
             alerta.status_entrega = "falhou"
             db.commit()
+            return
+
+        # Revalida a URL imediatamente antes de enviar: defende contra DNS
+        # rebinding (host que resolvia para IP público na criação e passa a
+        # resolver para um endereço interno depois). Falha definitiva, sem retry.
+        try:
+            validar_url_webhook(monitoramento.webhook_url)
+        except WebhookUrlInseguraError as exc:
+            alerta.status_entrega = "falhou"
+            db.commit()
+            logger.error("Webhook %s bloqueado por SSRF (%s): %s", alerta_id, monitoramento.webhook_url, exc)
             return
 
         processo = db.get(Processo, monitoramento.processo_id)
