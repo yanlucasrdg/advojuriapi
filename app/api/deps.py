@@ -1,7 +1,7 @@
 from collections.abc import AsyncGenerator
 
 from fastapi import Depends, HTTPException, Security, status
-from fastapi.security import APIKeyHeader
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,30 +10,24 @@ from app.db.session import get_db
 from app.models.api_key import ApiKey
 from app.models.tenant import Tenant
 
-api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+# HTTPBearer (em vez de um APIKeyHeader genérico) faz o Swagger UI tratar
+# isso como autenticação Bearer de verdade: o campo "Authorize" do /docs
+# passa a aceitar só a chave, sem precisar digitar "Bearer " na mão —
+# o próprio Swagger adiciona o prefixo antes de mandar o header.
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def _extrair_bearer(valor_header: str | None) -> str:
-    if not valor_header:
+async def get_current_tenant(
+    credenciais: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> Tenant:
+    if credenciais is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Header Authorization ausente. Use: Authorization: Bearer sua_chave",
         )
-    partes = valor_header.split(" ", 1)
-    if len(partes) != 2 or partes[0].lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Formato inválido. Use: Authorization: Bearer sua_chave",
-        )
-    return partes[1]
 
-
-async def get_current_tenant(
-    authorization: str | None = Security(api_key_header),
-    db: AsyncSession = Depends(get_db),
-) -> Tenant:
-    chave_texto_puro = _extrair_bearer(authorization)
-    chave_hash = hash_api_key(chave_texto_puro)
+    chave_hash = hash_api_key(credenciais.credentials)
 
     stmt = select(ApiKey).where(ApiKey.chave_hash == chave_hash)
     resultado = await db.execute(stmt)
