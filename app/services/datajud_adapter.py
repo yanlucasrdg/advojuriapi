@@ -24,7 +24,7 @@ Isso precisa ser resolvido no produto (schema `TipoBusca`) antes de vender
 a funcionalidade como está na landing page hoje.
 """
 
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
