@@ -22,7 +22,7 @@ def upgrade() -> None:
         "tenants",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column("criado_em", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("nome", sa.String(255), nullable=False),
         sa.Column("email", sa.String(255), nullable=False, unique=True),
         sa.Column("documento", sa.String(20), nullable=True),
         sa.Column("ativo", sa.Boolean, nullable=False, server_default=sa.true()),
