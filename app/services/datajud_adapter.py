@@ -155,19 +155,6 @@ class DataJudAdapter:
     async def __aexit__(self, *_exc_info) -> None:
         await self.close()
 
-    async def _buscar_hits(self, tribunal: str, query: dict[str, Any]) -> list[dict[str, Any]]:
-        """Cada tribunal é um índice Elasticsearch separado: resolve o alias
-        do índice, dispara a query DSL e devolve os `_source` dos hits."""
-        alias = ALIAS_TRIBUNAL.get(tribunal.upper())
-        if alias is None:
-            raise DataJudError(f"Tribunal '{tribunal}' não mapeado em ALIAS_TRIBUNAL")
-
-        resposta = await self._client.post(f"/{alias}/_search", json=query)
-        resposta.raise_for_status()
-
-        hits = resposta.json().get("hits", {}).get("hits", [])
-        return [hit["_source"] for hit in hits]
-
     async def buscar_por_numero_cnj(self, numero_cnj: str, tribunal: str) -> dict[str, Any] | None:
         """
         Busca um processo pelo número CNJ dentro do índice de um tribunal específico.
@@ -211,6 +198,38 @@ class DataJudAdapter:
         return self._extrair_hits(corpo, alias)
 
 
+def _parse_data_datajud(valor: str | None) -> datetime | None:
+    """
+    Parseia datas/horas vindas do DataJud.
+
+    Formato observado em produção (dado real, não fixture escrita à mão):
+    string compacta 'YYYYMMDDHHMMSS' sem separador nenhum, ex:
+    '20230714163257' = 2023-07-14 16:32:57. Isso só foi descoberto depois
+    do primeiro request real contra o DataJud em produção — os testes
+    locais usavam fixtures em ISO 8601 (suposição errada de como o CNJ
+    formata isso, nunca validada contra uma resposta de verdade).
+
+    Mantém fallback para ISO 8601 como segunda tentativa, caso o formato
+    varie entre tribunais ou o CNJ mude o schema no futuro — em vez de
+    assumir que o formato compacto é a única verdade possível.
+    """
+    if not valor:
+        return None
+    valor = valor.strip()
+
+    if valor.isdigit() and len(valor) == 14:
+        try:
+            return datetime.strptime(valor, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    try:
+        return datetime.fromisoformat(valor.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("Não foi possível parsear data do DataJud: %r", valor)
+        return None
+
+
 def normalizar_processo_datajud(bruto: dict[str, Any], tribunal: str) -> dict[str, Any]:
     """
     Converte o payload cru do DataJud (schema do CNJ) para o formato
@@ -222,10 +241,18 @@ def normalizar_processo_datajud(bruto: dict[str, Any], tribunal: str) -> dict[st
     for mov in movimentos_brutos:
         descricao = mov.get("nome", "")
         data_str = mov.get("dataHora", "")
+        data_movimento_dt = _parse_data_datajud(data_str)
+        if data_movimento_dt is None:
+            # data_movimento é NOT NULL no banco — um movimento sem data
+            # parseável não pode virar linha inválida; melhor perder esse
+            # movimento específico (com log) do que quebrar a consulta
+            # inteira ou gravar lixo.
+            logger.warning("Movimento sem data parseável, ignorado: %r", mov)
+            continue
         dedup_source = f"{data_str}|{descricao}"
         movimentos.append(
             {
-                "data_movimento": data_str,
+                "data_movimento": data_movimento_dt,
                 "descricao": descricao,
                 "codigo_cnj": str(mov.get("codigo", "")) or None,
                 "hash_dedup": sha256_hex(dedup_source),
@@ -243,6 +270,8 @@ def normalizar_processo_datajud(bruto: dict[str, Any], tribunal: str) -> dict[st
         for p in partes_brutas
     ]
 
+    data_ajuizamento_dt = _parse_data_datajud(bruto.get("dataAjuizamento"))
+
     return {
         "numero_cnj": bruto.get("numeroProcesso", ""),
         "tribunal": tribunal.upper(),
@@ -250,7 +279,7 @@ def normalizar_processo_datajud(bruto: dict[str, Any], tribunal: str) -> dict[st
         "assunto": ", ".join(a.get("nome", "") for a in bruto.get("assuntos", []) or []) or None,
         "orgao_julgador": (bruto.get("orgaoJulgador") or {}).get("nome"),
         "valor_acao": None,  # nem sempre presente no DataJud; depende do tribunal
-        "data_ajuizamento": bruto.get("dataAjuizamento"),
+        "data_ajuizamento": data_ajuizamento_dt.date() if data_ajuizamento_dt else None,
         "segredo_justica": (bruto.get("nivelSigilo") or 0) > 0,
         "fonte": "datajud",
         "atualizado_em": datetime.now(timezone.utc),
