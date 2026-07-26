@@ -39,6 +39,16 @@ async def consultar_processo(
     então precisamos saber onde procurar antes de gastar o request.
     """
     custo = settings.PRECO_CONSULTA_PROCESSO_CENTAVOS
+
+    # Normaliza uma vez só, no início, e usa essa versão em tudo daqui pra
+    # frente. O DataJud devolve numeroProcesso sem pontuação (é o que fica
+    # gravado no banco), mas o cliente pode mandar o número na URL com ou
+    # sem pontuação — se não normalizar aqui, a busca no cache nunca bate
+    # com o que já está salvo, todo request vira um "novo" processo, e a
+    # segunda consulta em diante quebra com UniqueViolationError na hora
+    # de inserir (bug real, encontrado ao testar a segunda chamada em
+    # produção — a primeira sempre "funcionava" porque inseria do zero).
+    numero_cnj = numero_cnj.replace(".", "").replace("-", "")
     termo_hash = hash_termo_busca(numero_cnj)
 
     # 1. Tenta cache primeiro — nem olha pro saldo se já temos o dado fresco,
