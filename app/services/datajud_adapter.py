@@ -212,6 +212,14 @@ def _parse_data_datajud(valor: str | None) -> datetime | None:
     Mantém fallback para ISO 8601 como segunda tentativa, caso o formato
     varie entre tribunais ou o CNJ mude o schema no futuro — em vez de
     assumir que o formato compacto é a única verdade possível.
+
+    Retorna sempre datetime NAIVE (sem tzinfo), mesmo quando a entrada tem
+    fuso horário explícito (ex: sufixo 'Z'). As colunas correspondentes no
+    Postgres são TIMESTAMP WITHOUT TIME ZONE — asyncpg rejeita com
+    TypeError se receber um datetime tz-aware pra essas colunas ("can't
+    subtract offset-naive and offset-aware datetimes"). O valor semântico
+    já é sempre UTC (é o padrão do DataJud e o que usamos internamente),
+    só removemos o tzinfo explícito pra bater com o tipo da coluna.
     """
     if not valor:
         return None
@@ -219,12 +227,13 @@ def _parse_data_datajud(valor: str | None) -> datetime | None:
 
     if valor.isdigit() and len(valor) == 14:
         try:
-            return datetime.strptime(valor, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+            return datetime.strptime(valor, "%Y%m%d%H%M%S")  # já naive
         except ValueError:
             pass
 
     try:
-        return datetime.fromisoformat(valor.replace("Z", "+00:00"))
+        parseado = datetime.fromisoformat(valor.replace("Z", "+00:00"))
+        return parseado.replace(tzinfo=None) if parseado.tzinfo is not None else parseado
     except ValueError:
         logger.warning("Não foi possível parsear data do DataJud: %r", valor)
         return None
@@ -282,7 +291,9 @@ def normalizar_processo_datajud(bruto: dict[str, Any], tribunal: str) -> dict[st
         "data_ajuizamento": data_ajuizamento_dt.date() if data_ajuizamento_dt else None,
         "segredo_justica": (bruto.get("nivelSigilo") or 0) > 0,
         "fonte": "datajud",
-        "atualizado_em": datetime.now(timezone.utc),
+        # naive de propósito (ver docstring de _parse_data_datajud) — a
+        # coluna é TIMESTAMP WITHOUT TIME ZONE, valor semântico é UTC.
+        "atualizado_em": datetime.now(timezone.utc).replace(tzinfo=None),
         "partes": partes,
         "movimentos": movimentos,
     }
