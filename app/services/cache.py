@@ -25,7 +25,13 @@ def cache_esta_fresco(processo: Processo) -> bool:
     Movimentos mudam mais rápido que cadastro (classe/assunto/partes raramente
     mudam depois de distribuído). Usamos um TTL mais curto para considerar
     o cache "fresco o bastante pra não rebater na fonte".
+
+    `agora` é naive (sem tzinfo) de propósito: `processo.atualizado_em` vem
+    de uma coluna TIMESTAMP WITHOUT TIME ZONE, então já é naive por
+    construção. Comparar naive com aware levanta TypeError em Python — o
+    valor semântico dos dois lados é sempre UTC, só não carregamos o tzinfo
+    explícito nessa tabela.
     """
-    agora = datetime.now(timezone.utc)
+    agora = datetime.now(timezone.utc).replace(tzinfo=None)
     limite = processo.atualizado_em + timedelta(hours=settings.CACHE_TTL_MOVIMENTOS_HORAS)
     return agora < limite
