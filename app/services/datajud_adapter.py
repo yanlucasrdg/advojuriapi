@@ -1,4 +1,3 @@
-=========== datajud_adapter.py ===========
 """
 Adapter da API Pública do DataJud (CNJ).
 
