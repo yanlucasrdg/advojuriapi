@@ -1,4 +1,3 @@
-import hashlib
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -11,7 +10,6 @@ from app.core.hashing import hash_termo_busca
 from app.db.session import get_db
 from app.models.tenant import Tenant
 from app.schemas.busca import BuscaResponse, ConfiancaMatch, ResultadoBusca, TipoBusca
-from app.services import billing
 from app.services.cnpj_resolver import (
     CnpjInvalidoError,
     CnpjNaoEncontradoError,
@@ -128,6 +126,8 @@ async def buscar(
                 resultados.append(
                     ResultadoBusca(processo=dados, confianca_match=ConfiancaMatch.PROVAVEL)
                 )
+    finally:
+        await adapter.close()
 
     if len(tribunais_com_falha) == len(tribunais_alvo):
         # Nenhum tribunal respondeu: não existe busca a cobrar, e devolver
@@ -140,21 +140,16 @@ async def buscar(
     # Cobra pela busca (mesmo com zero resultados — o trabalho de pesquisar
     # em N tribunais foi feito; diferente de /processos, aqui não há "match
     # exato" que justifique isentar consulta sem resultado).
-    try:
-        await billing.debitar(db, tenant.id, custo, descricao=f"Busca por {tipo.value}")
-    except billing.SaldoInsuficienteError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Saldo insuficiente") from exc
+    await consultas.cobrar(db, tenant.id, custo, descricao=f"Busca por {tipo.value}")
 
-    db.add(
-        ConsultaLog(
-            tenant_id=tenant.id,
-            tipo_busca=tipo.value,
-            termo_busca_hash=termo_hash,
-            custo_centavos=custo,
-            resultado_encontrado=len(resultados) > 0,
-            origem_cache=False,
-        )
+    consultas.registrar_consulta(
+        db,
+        tenant.id,
+        tipo_busca=tipo.value,
+        termo_hash=termo_hash,
+        custo_centavos=custo,
+        resultado_encontrado=len(resultados) > 0,
+        origem_cache=False,
     )
     await db.commit()
 
