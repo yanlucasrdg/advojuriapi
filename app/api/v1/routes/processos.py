@@ -2,7 +2,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from app.core.cnj import normalizar_numero_cnj
 from app.api import consultas
 from app.api.deps import get_current_tenant
 from app.core.config import get_settings
@@ -48,7 +48,7 @@ async def consultar_processo(
     # segunda consulta em diante quebra com UniqueViolationError na hora
     # de inserir (bug real, encontrado ao testar a segunda chamada em
     # produção — a primeira sempre "funcionava" porque inseria do zero).
-    numero_cnj = numero_cnj.replace(".", "").replace("-", "")
+    numero_cnj = normalizar_numero_cnj(numero_cnj)
     termo_hash = hash_termo_busca(numero_cnj)
 
     # 1. Tenta cache primeiro — nem olha pro saldo se já temos o dado fresco,
