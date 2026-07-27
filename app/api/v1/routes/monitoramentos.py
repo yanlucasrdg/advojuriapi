@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_tenant
+from app.core.cnj import normalizar_numero_cnj
 from app.core.security import gerar_webhook_secret
 from app.core.ssrf import WebhookUrlInseguraError, validar_url_webhook
 from app.db.session import get_db
@@ -35,7 +36,14 @@ async def criar_monitoramento(
     except WebhookUrlInseguraError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    stmt = select(Processo).where(Processo.numero_cnj == payload.numero_cnj)
+    # Ver app/core/cnj.py — o valor salvo vem do DataJud sem pontuação,
+    # a busca precisa usar o mesmo formato, senão nunca bate com o que já
+    # está no cache (mesmo bug já corrigido antes em /v1/processos,
+    # reaparecendo aqui por ser uma rota separada que nunca recebeu o
+    # mesmo fix — motivo pelo qual isso agora é uma função compartilhada,
+    # não mais lógica duplicada em cada rota).
+    numero_cnj_normalizado = normalizar_numero_cnj(payload.numero_cnj)
+    stmt = select(Processo).where(Processo.numero_cnj == numero_cnj_normalizado)
     resultado = await db.execute(stmt)
     processo = resultado.scalar_one_or_none()
 
