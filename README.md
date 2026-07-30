@@ -13,22 +13,34 @@ e adapter de integração com a API Pública do DataJud (CNJ).
 - **Cache**: consultas repetidas dentro do TTL não rebatem no DataJud.
 - **Testes**: lógica de billing coberta (`tests/test_billing.py`).
 
-## Busca por CNPJ / nome / CPF (`GET /v1/busca`)
+## Busca por CNPJ / nome / CPF (`GET /v1/busca`) — **DESATIVADA**
 
-- **CNPJ**: resolvido para razão social via BrasilAPI (espelha dados abertos
-  da Receita Federal), depois pesquisado por nome (fuzzy) num conjunto de
-  tribunais. Resposta vem com `confianca_match: "provavel"` e um `aviso`
-  explicando a limitação — não é match exato garantido por CNPJ, porque o
-  DataJud não indexa CNPJ da parte diretamente.
-- **Nome**: mesmo fluxo de fuzzy match, direto.
-- **CPF**: **não suportado**, retorna `400` com explicação. Não existe base
-  pública/gratuita que mapeie CPF a nome no Brasil (diferente do CNPJ, que é
-  dado aberto na Receita). Resolver isso exigiria contratar um bureau de
-  dados cadastrais com base legal própria de tratamento — decisão de produto
-  e jurídica, não pendência técnica.
-- A busca faz **fan-out numa lista curada de tribunais** (`TRIBUNAIS_BUSCA_PADRAO`
-  em `app/core/config.py`), porque o DataJud não faz busca cross-tribunal.
-  Cada tribunal a mais na lista = mais latência e mais custo de rate-limit.
+Retorna `501` pros três tipos (`cpf`, `cnpj`, `nome`). Motivo, descoberto
+em produção, não em teoria:
+
+**A API Pública do DataJud não expõe nome de parte.** Confirmado
+empiricamente inspecionando 20 processos reais (10 do TRF3, 10 do TJSP,
+via console do Railway com a chave de produção) — nenhum tinha o campo
+`partes` na resposta. Não é sigilo pontual (`nivelSigilo: 0` em todos), é
+ausência estrutural do campo no schema público. Bate com a documentação
+do CNJ, que só menciona acesso a "capas processuais e movimentações" —
+nunca partes.
+
+Isso significa que buscar por CNPJ/nome via fuzzy match em `partes.nome`
+(o que essa rota fazia) é **logicamente impossível** com essa fonte, não
+importa como a query seja escrita. Continuar oferecendo o endpoint
+fingindo funcionar (200 com lista sempre vazia) seria pior que desativar:
+cobraria o cliente por um resultado que nunca pode existir.
+
+**Código preservado, não deletado**: toda a lógica (resolver CNPJ via
+BrasilAPI, fan-out por tribunal, tracking de `tribunais_com_falha`) está
+em `app/services/_busca_por_parte_dormant.py`, pronta pra reativar se uma
+fonte com dado de parte for integrada (ex: bureau de dados pago). Ver o
+docstring desse arquivo para o passo a passo de reativação.
+
+**CPF**: continua sem solução própria — nunca existiu base pública que
+mapeie CPF a nome no Brasil (LGPD). Isso é independente do problema do
+CNPJ/nome acima.
 
 ## Worker de monitoramento (Celery)
 
@@ -173,11 +185,15 @@ Railway.
    tribunal vai tentar e falhar independentemente a cada varredura, gerando
    ruído de retry. Um circuit breaker por tribunal (pular por N minutos após
    K falhas seguidas) é o próximo refinamento natural aqui.
-8. **`enviar_webhook` não valida SSRF.** `webhook_url` só é checado quanto a
-   `https://`, mas nada impede um cliente malicioso de apontar para um
-   endereço interno (ex: `169.254.169.254`, metadados de cloud). Antes de
-   expor isso a clientes não confiáveis, adicionar validação de IP privado/
-   reservado no momento da criação do monitoramento.
+8. **~~`enviar_webhook` não valida SSRF~~ — resolvido.** `app/core/ssrf.py`
+   valida IP privado/reservado/loopback/link-local tanto na criação do
+   monitoramento (`POST /v1/monitoramentos`) quanto revalidado no worker
+   antes de cada envio (defesa contra DNS rebinding). Coberto por testes
+   em `tests/test_ssrf.py`.
+9. **Busca por CNPJ/nome desativada** (ver seção específica acima) — a
+   API Pública do DataJud não expõe nome de parte, confirmado empiricamente
+   em produção. Não tem correção de código; precisaria de uma fonte de
+   dados adicional.
 
 ## Setup local
 
@@ -236,7 +252,7 @@ asyncio.run(main())
 ```bash
 curl "http://localhost:8000/v1/processos/5005023-96.2023.4.03.6309?tribunal=TRF3" \
   -H "Authorization: Bearer ajr_live_sua_chave"
-
-curl "http://localhost:8000/v1/busca?tipo=cnpj&termo=00623904000173" \
-  -H "Authorization: Bearer ajr_live_sua_chave"
 ```
+
+`GET /v1/busca` está desativado (ver seção específica acima) — retorna
+`501` explicando o motivo, não tem mais exemplo de uso funcional aqui.
